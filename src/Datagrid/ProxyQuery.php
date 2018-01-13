@@ -55,6 +55,11 @@ class ProxyQuery implements ProxyQueryInterface
     private $hints = [];
 
     /**
+     * @var bool
+     */
+    private $getFixedQueryBuilderOptimized = false;
+
+    /**
      * @param QueryBuilder $queryBuilder
      */
     public function __construct($queryBuilder)
@@ -258,12 +263,40 @@ class ProxyQuery implements ProxyQueryInterface
     }
 
     /**
+     * @param bool $getFixedQueryBuilderOptimized
+     */
+    public function setGetFixedQueryBuilderOptimized($getFixedQueryBuilderOptimized)
+    {
+        $this->getFixedQueryBuilderOptimized = $getFixedQueryBuilderOptimized;
+    }
+
+    /**
      * This method alters the query to return a clean set of object with a working
      * set of Object.
      *
+     * @param QueryBuilder $queryBuilder
+     *
      * @return QueryBuilder
+     * @throws \Doctrine\Common\Persistence\Mapping\MappingException
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \ReflectionException
      */
     protected function getFixedQueryBuilder(QueryBuilder $queryBuilder)
+    {
+        return $this->getFixedQueryBuilderOptimized ?
+            $this->getFixedQueryBuilderOptimized($queryBuilder) :
+            $this->getFixedQueryBuilderOriginal($queryBuilder);
+    }
+
+    /**
+     * @param QueryBuilder $queryBuilder
+     *
+     * @return QueryBuilder
+     * @throws \Doctrine\Common\Persistence\Mapping\MappingException
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \ReflectionException
+     */
+    private function getFixedQueryBuilderOriginal(QueryBuilder $queryBuilder)
     {
         $queryBuilderId = clone $queryBuilder;
         $rootAlias = current($queryBuilderId->getRootAliases());
@@ -327,6 +360,85 @@ class ProxyQuery implements ProxyQueryInterface
                 $queryBuilder->setFirstResult(null);
             }
         }
+
+        return $queryBuilder;
+    }
+
+    /**
+     * @param QueryBuilder $queryBuilder
+     *
+     * @return QueryBuilder
+     * @throws \Doctrine\Common\Persistence\Mapping\MappingException
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \ReflectionException
+     */
+    private function getFixedQueryBuilderOptimized(QueryBuilder $queryBuilder)
+    {
+        $queryBuilderId = clone $queryBuilder;
+        $rootAlias = current($queryBuilderId->getRootAliases());
+
+        // step 1 : retrieve the targeted class
+        $from = $queryBuilderId->getDQLPart('from');
+        $class = $from[0]->getFrom();
+        $metadata = $queryBuilderId->getEntityManager()->getMetadataFactory()->getMetadataFor($class);
+
+        // step 2 : retrieve identifier columns
+        $idNames = $metadata->getIdentifierFieldNames();
+
+        // step 3 : retrieve the different subjects ids
+        $selects = [];
+        $idxSelect = '';
+        foreach ($idNames as $idName) {
+            $select = sprintf('%s.%s', $rootAlias, $idName);
+            // Put the ID select on this array to use it on results QB
+            $selects[$idName] = $select;
+            // Use IDENTITY if id is a relation too.
+            // See: http://doctrine-orm.readthedocs.org/en/latest/reference/dql-doctrine-query-language.html
+            // Should work only with doctrine/orm: ~2.2
+            $idSelect = $select;
+            if ($metadata->hasAssociation($idName)) {
+                $idSelect = sprintf('IDENTITY(%s) as %s', $idSelect, $idName);
+            }
+            $idxSelect .= ('' !== $idxSelect ? ', ' : '').$idSelect;
+        }
+        $queryBuilderId->select($idxSelect);
+
+        // for SELECT DISTINCT, ORDER BY expressions must appear in idxSelect list
+        /* Consider
+            SELECT DISTINCT x FROM tab ORDER BY y;
+        For any particular x-value in the table there might be many different y
+        values.  Which one will you use to sort that x-value in the output?
+        */
+        $queryId = $queryBuilderId->getQuery();
+        $queryId->setHint(Query::HINT_CUSTOM_TREE_WALKERS, [OrderByToSelectWalker::class]);
+        $results = $queryId->execute([], Query::HYDRATE_ARRAY);
+        $platform = $queryBuilderId->getEntityManager()->getConnection()->getDatabasePlatform();
+        $idxMatrix = [];
+        foreach ($results as $id) {
+            foreach ($idNames as $idName) {
+                // Convert ids to database value in case of custom type, if provided.
+                $fieldType = $metadata->getTypeOfField($idName);
+                $idVals[$idName] = $fieldType && Type::hasType($fieldType)
+                    ? Type::getType($fieldType)->convertToDatabaseValue($id[$idName], $platform)
+                    : $id[$idName];
+            }
+            $idxMatrix[] = $idVals;
+        }
+
+        // step 4 : alter the query to match the targeted ids
+        foreach ($idxMatrix as $rowNum => $idVals) {
+            $conditions = [];
+            foreach ($idVals as $pkName => $idVal) {
+                $idxParamName = sprintf('%s_%s_idx', $idName, $rowNum);
+                $idxParamName = preg_replace('/[^\w]+/', '_', $idxParamName);
+                $conditions[] = sprintf('%s = :%s', $pkName, $idxParamName);
+                $queryBuilder->setParameter($idxParamName, $idVal);
+            }
+            $queryBuilder->orWhere('('.implode(' AND ', $conditions).')');
+        }
+
+        $queryBuilder->setMaxResults(null);
+        $queryBuilder->setFirstResult(null);
 
         return $queryBuilder;
     }
